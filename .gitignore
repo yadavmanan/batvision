@@ -37,3 +37,6 @@ models/*.onnx
 models/*.bin
 models/*.pt
 models/*.weights
+
+# keep the template
+!.env.example
