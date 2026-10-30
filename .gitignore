@@ -1,0 +1,39 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.pytype/
+*.egg-info/
+build/
+dist/
+
+# Local secrets
+.env
+.env.*
+
+# Local runtime outputs
+*.log
+*.jsonl
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Project-specific large artifacts
+models/*.onnx
+models/*.bin
+models/*.pt
+models/*.weights

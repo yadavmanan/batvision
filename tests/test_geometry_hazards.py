@@ -1,0 +1,146 @@
+"""Synthetic scenes rendered from the same camera model: floor + box / branch."""
+import copy
+import math
+
+import numpy as np
+import pytest
+
+from batvision.edge.config import DEFAULTS
+from batvision.edge.geometry import CameraGeometry
+from batvision.edge.hazards import HazardPipeline
+
+H_CAM, PITCH, HFOV, W, H = 1.3, 12.0, 70.0, 640, 480
+S = 160
+
+
+def render(obstacle=None):
+    """Metric Z map: floor everywhere, optional vertical plate
+    obstacle = (forward_m, x_min, x_max, h_min, h_max)."""
+    g = CameraGeometry(HFOV, W, H, H_CAM, PITCH)
+    tx, ty, z_floor = g.rays(S, S)
+    Z = np.broadcast_to(np.minimum(z_floor, 30.0), (S, S)).copy()
+    if obstacle:
+        f, x0, x1, h0, h1 = obstacle
+        p = math.radians(PITCH)
+        z_plate = f / (math.cos(p) - ty * math.sin(p))
+        z_plate = np.broadcast_to(z_plate, (S, S))
+        X = z_plate * tx
+        Hh = H_CAM - z_plate * (ty * math.cos(p) + math.sin(p))
+        hit = (z_plate < Z) & (X >= x0) & (X <= x1) & (Hh >= h0) & (Hh <= h1)
+        Z = np.where(hit, z_plate, Z)
+    return Z.astype(np.float32)
+
+
+def to_relative(Z, rng):
+    r = 3.0 / Z + 0.5                        # unknown affine in inverse depth, like MiDaS
+    return (r + rng.normal(0, 0.01, r.shape)).astype(np.float32)
+
+
+def make_pipeline(output="relative_inverse"):
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["camera"].update(hfov_deg=HFOV, width=W, height=H)
+    cfg["mount"].update(height_m=H_CAM, pitch_deg=PITCH)
+    return HazardPipeline(cfg, output, W, H)
+
+
+def test_floor_only_is_not_a_hazard():
+    rng = np.random.default_rng(0)
+    pipe = make_pipeline()
+    for _ in range(6):
+        hf = pipe.process(to_relative(render(), rng))
+    assert pipe.calibrator.calibrated
+    assert hf.hazards == []
+
+
+def test_calibration_recovers_metric_scale():
+    rng = np.random.default_rng(1)
+    pipe = make_pipeline()
+    Z = render()
+    for _ in range(5):
+        pipe.process(to_relative(Z, rng))
+    Zm = pipe.calibrator.to_metric(to_relative(Z, rng))
+    band = slice(int(0.75 * S), S)
+    rel_err = np.abs(Zm[band] - Z[band]) / Z[band]
+    assert np.median(rel_err) < 0.05
+
+
+def test_box_ahead_is_critical_with_distance():
+    rng = np.random.default_rng(2)
+    pipe = make_pipeline()
+    for _ in range(5):                      # walk in with a clear floor first
+        pipe.process(to_relative(render(), rng))
+    hf = pipe.process(to_relative(render((1.0, -0.25, 0.25, 0.0, 1.0)), rng))
+    center = [h for h in hf.hazards if h.zone == "CENTER"]
+    assert center, hf.hazards
+    assert all(h.urgency == "CRITICAL" for h in center)
+    assert min(h.distance_m for h in center) == pytest.approx(1.0, abs=0.2)
+    assert {h.level for h in center} <= {"GROUND", "TORSO"}
+
+
+def test_head_height_branch_detected_but_cane_level_clear():
+    pipe = make_pipeline(output="metric")   # metric model path: no calibration needed
+    hf = pipe.process(render((1.4, -0.5, 0.5, 1.45, 1.75)))
+    levels = {(h.zone, h.level): h for h in hf.hazards}
+    assert ("CENTER", "HEAD") in levels
+    assert levels[("CENTER", "HEAD")].urgency == "CRITICAL"   # critical_head_m = 1.6
+    assert ("CENTER", "GROUND") not in levels
+
+
+def test_side_obstacle_is_warning_not_critical():
+    pipe = make_pipeline(output="metric")
+    hf = pipe.process(render((1.0, 0.5, 1.2, 0.0, 1.5)))
+    right = [h for h in hf.hazards if h.zone == "RIGHT"]
+    assert right and all(h.urgency == "WARNING" for h in right)
+    assert not [h for h in hf.hazards if h.zone == "CENTER"]
+
+
+def test_adjacent_levels_merge_and_preserve_worst_urgency_and_distance():
+    pipe = make_pipeline(output="metric")
+    hf = pipe.process(render((1.0, -0.30, 0.30, 0.0, 1.2)))
+    center = [h for h in hf.hazards if h.zone == "CENTER"]
+    assert len(center) == 1
+    assert center[0].urgency == "CRITICAL"
+    assert center[0].distance_m == pytest.approx(1.0, abs=0.2)
+
+
+def _floor_with_drop(edge_forward_m, drop_m):
+    """Metric depth of a flat floor whose surface steps down by drop_m beyond edge_forward_m."""
+    pipe = make_pipeline(output="metric")
+    _, _, floor_depth = pipe.geometry.rays(S, S)
+    z = np.minimum(np.broadcast_to(floor_depth, (S, S)), 30.0)
+    forward = pipe.geometry.backproject(z.astype(np.float32)).forward
+    lowered = z * (H_CAM + drop_m) / H_CAM
+    return pipe, np.where(forward > edge_forward_m, lowered, z).astype(np.float32)
+
+
+def test_dropoff_is_separate_ground_hazard():
+    pipe, depth = _floor_with_drop(1.4, 0.6)
+    hf = pipe.process(depth)
+    drops = [h for h in hf.hazards if h.label == "drop-off"]
+    assert drops
+    center = [h for h in drops if h.zone == "CENTER"]
+    assert center and center[0].urgency == "CRITICAL"
+    assert center[0].distance_m == pytest.approx(1.4, abs=0.3)
+    assert all(h.level == "GROUND" for h in drops)
+
+
+def test_far_dropoff_is_only_a_warning():
+    pipe, depth = _floor_with_drop(2.2, 0.6)
+    center = [h for h in pipe.process(depth).hazards if h.label == "drop-off" and h.zone == "CENTER"]
+    assert center and center[0].urgency == "WARNING"
+
+
+def test_depth_error_on_flat_floor_is_not_a_dropoff():
+    # 15% overestimate of far floor depth reads as ~0.2 m below the plane: noise, not a drop-off.
+    pipe, depth = _floor_with_drop(2.0, 0.0)
+    z = np.minimum(np.broadcast_to(pipe.geometry.rays(S, S)[2], (S, S)), 30.0)
+    forward = pipe.geometry.backproject(z.astype(np.float32)).forward
+    noisy = np.where(forward > 2.0, z * 1.15, z).astype(np.float32)
+    assert not [h for h in pipe.process(noisy).hazards if h.label == "drop-off"]
+
+
+def test_depth_grid_is_metric():
+    pipe = make_pipeline(output="metric")
+    hf = pipe.process(render())
+    assert hf.depth_grid.kind == "metric_m"
+    assert len(hf.depth_grid.values) == hf.depth_grid.rows * hf.depth_grid.cols
